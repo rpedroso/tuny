@@ -1,0 +1,55 @@
+# coding: utf-8
+
+# Sample configuration
+
+class Handshake:
+    # tlslite defaults. See tlslite documentation.
+    minKeySize = 1023
+    maxKeySize = 8193
+    cipherNames = ["aes256", "aes128", "3des", "rc4"]
+    cipherImplementations = ["cryptlib", "openssl", "pycrypto", "python"]
+    certificateTypes = ["x509", "cryptoID"]
+    minVersion = (3,0)
+    maxVersion = (3,2)
+
+
+class conf_defaults:
+    server = None
+    host = None
+    port = 8000
+    tuntap_ip = None
+    tuntap_name = 'tap'
+    auth_bits = 2048
+    handshake = Handshake
+    auth_users = [("user1", "!odr@cir#"), ('user2', 'kasdn')]
+
+
+class server01(conf_defaults):
+    server = True
+    host = '0.0.0.0'
+    port = 8000
+    tuntap_ip = '192.168.88.1'
+    tuntap_name = 'vpn'
+    auth_bits = 1024
+
+
+class server02(server01):
+    port = 8001
+    tuntap_ip = '192.168.99.1'
+
+
+class client01(conf_defaults):
+    server = False
+    host = '10.0.2.2'
+    port = 8000
+    tuntap_ip = '192.168.88.10'
+    tuntap_name = 'vpn'
+    auth_username = "user1"
+    auth_password = "!odr@cir#"
+    auth_bits = 1024
+
+class client02(client01):
+    tuntap_ip = '192.168.88.11'
+    auth_username = "user2"
+    auth_password = "kasdn"
+

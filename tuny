@@ -1,0 +1,495 @@
+#!/usr/bin/env python
+
+#  Copyright (C) 2011 Ricardo Pedroso <rmdpedroso@gmail.com>
+#  See LICENSE for details.
+
+import logging
+import logging.handlers
+import os, sys
+import socket
+import struct
+from struct import pack, unpack
+from fcntl import ioctl
+from tlslite.VerifierDB import VerifierDB
+from tlslite.TLSConnection import TLSConnection
+from tlslite.HandshakeSettings import HandshakeSettings
+from tlslite.errors import TLSAbruptCloseError
+import select
+import time
+
+
+ROOTDIR = os.path.dirname(os.path.abspath(__file__))
+settings = {}
+execfile(os.path.join(ROOTDIR, 'conf.py'), settings)
+
+
+log = logging.getLogger("tuny")
+log.setLevel(logging.INFO)
+console = logging.handlers.SysLogHandler(address='/dev/log')
+formatter = logging.Formatter('%(name)s: %(levelname)s %(message)s')
+console.setFormatter(formatter)
+log.addHandler(console)
+
+
+TUNSETIFF = 0x400454ca
+
+
+IFF_TUN         = 0x0001   # tunnel IP packets
+IFF_TAP         = 0x0002   # tunnel ethernet frames
+IFF_NO_PI       = 0x1000   # don't pass extra packet info
+
+
+class MyTLSConnection(TLSConnection):
+    def fileno(self):
+        return self.sock.fileno()
+
+
+def read_data(fd, n):
+    buf = fd.recv(n)
+    return len(buf), buf
+
+
+def write_data(fd, buf):
+    return fd.send(buf)
+
+
+def read_all_data(fd, n):
+    '''
+    read_all_data: ensures we read exactly n bytes
+    '''
+    tmp = []
+    left = n
+    nread = 0
+    while left > 0:
+        nn, buf = read_data(fd, left)
+        if buf:
+            nread += nn
+            tmp.append(buf)
+            left -= nn
+        else:
+            break
+
+    return nread, ''.join(tmp)
+
+
+def get_local_hwaddr(ifname):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    info = ioctl(s.fileno(), 0x8927,  pack('256s', ifname[:16]))
+    return ''.join(['%02x' % ord(char) for char in info[18:24]])
+
+
+def get_src_hwaddr_from_packet(buf):
+    info = unpack('!6B', buf[0:6])
+    return ''.join(['%02x' % char for char in info])
+
+
+#def get_dst_hwaddr_from_packet(buf):
+#    info = unpack('!6B', buf[6:12])
+#    return ''.join(['%02x' % char for char in info])
+
+
+class TunTap(object):
+    def __init__(self, name='tun', mode=IFF_TAP|IFF_NO_PI):
+        log.info("TUNTAP: setting device %s" % name)
+        self._fd = os.open("/dev/net/tun", os.O_RDWR)
+        self._ifs = ifs = ioctl(self._fd, TUNSETIFF, pack("16sH", name + "%d", mode))
+        self._name = ifs[:16].strip("\x00")
+        log.info("TUNTAP: device setup done: %s" % self._name)
+
+    @property
+    def name(self):
+        return self._name
+
+    def fileno(self):
+        return self._fd
+
+    def recv(self, limit):
+        return os.read(self._fd, limit)
+
+    def send(self, buf):
+        return os.write(self._fd, buf)
+
+
+def tap_open(prefix):
+    return TunTap(name=prefix)
+
+
+def socket_open():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return sock
+
+
+def socket_bind_and_listen(sock, host, port, backlog):
+    sock.bind((host, port))
+    sock.listen(backlog)
+
+
+def authentication_settings(name):
+    hs = HandshakeSettings()
+    for k,v in settings[name].handshake.__dict__.iteritems():
+        if k.startswith('__'): continue
+        setattr(hs, k, v)
+
+    return hs
+
+
+def authentication_server(name, conn):
+    users = settings[name].auth_users
+    bits = settings[name].auth_bits
+
+
+    verifierDB = VerifierDB()
+    for u, p in users:
+        verifier = VerifierDB.makeVerifier(u, p, bits)
+        verifierDB[u] = verifier
+
+    handshake = authentication_settings(name)
+    tlsconn = MyTLSConnection(conn)
+    try:
+        tlsconn.handshakeServer(verifierDB=verifierDB, settings=handshake)
+        log.info("SERVER: Handshake done using config class `%s`" % name)
+    except socket.error:
+        tlsconn.close()
+        tlsconn = None
+        log.info("SERVER: Handshake failed using config class `%s`" % name)
+    return tlsconn
+
+
+def authentication_client(name, conn):
+    u = settings[name].auth_username
+    p = settings[name].auth_password
+    handshake = authentication_settings(name)
+    tlsconn = MyTLSConnection(conn)
+    try:
+        tlsconn.handshakeClientSRP(u, p, settings=handshake)
+        log.info("CLIENT: Handshake done using config class `%s`" % name)
+    except socket.error:
+        tlsconn.close()
+        tlsconn = None
+        log.info("CLIENT: Handshake failed using config class `%s`" % name)
+    return tlsconn
+
+
+def print_tlsinfo(conn):
+    versions = {
+        (3,0): 'SSL 3.0',
+        (3,1): 'TLS 1.0',
+        (3,2): 'TLS 1.1',
+    }
+    cipher_name = conn.getCipherName()
+    cipher_impl = conn.getCipherImplementation()
+    version = versions[conn.version]
+    conn_info = '''\
+Connection Info: \
+Cipher Name: %(cipher_name)s \
+Cipher Implementation: %(cipher_impl)s \
+Version: %(version)s \
+''' % locals()
+
+    log.info(conn_info)
+
+
+BUFSIZE = 2048
+def mainloop_server(tun, sock, name):
+    inp = [sock]
+    tap2net = 0; net2tap = 0
+    clients = {}
+    while True:
+        inputready, outputready, exceptready = select.select(inp,[],[])
+        for s in inputready:
+
+            if s is sock:
+                conn, address = sock.accept()
+                log.info("SERVER: Client connected from %s" % repr(address))
+
+                log.info('SERVER: prepare authentication')
+                conn = authentication_server(name, conn)
+                if not conn:
+                    continue
+                #authentication_server(name, conn)
+                log.info('SERVER: Client successfuly authenticated')
+
+                print_tlsinfo(conn)
+
+                inp.append(conn)
+                if not inp.count(tun):
+                    # First client add tun
+                    inp.append(tun)
+
+                nread, hwaddr = read_all_data(conn, 12)
+                clients[hwaddr] = conn
+                conn = None
+                continue
+
+            if s is tun:
+                # data from tun/tap: just read it and write it to the network
+                nread, buf = read_data(tun, BUFSIZE)
+                tap2net += 1
+                log.debug("SERVER: TAP2NET %lu: Read %d bytes from the tap interface" % (tap2net, nread))
+
+                hwaddr = get_src_hwaddr_from_packet(buf)
+                if clients.has_key(hwaddr):
+                    conns = [clients[hwaddr],]
+                else:
+                    conns = clients.values()
+
+                # write length + packet
+                for conn in conns:
+                    try:
+                        nwrite = write_data(conn, "%s%s" % (pack('!H', nread), buf))
+                        log.debug("SERVER: TAP2NET %lu: Written %d bytes to the network" % (tap2net, nwrite))
+                    except (socket.error, TLSAbruptCloseError, struct.error):
+                        # The other end died
+                        conn.close()
+                        try:
+                            inp.remove(conn)
+                        except ValueError:
+                            pass
+                        clients = dict([(k,v) for k,v in clients.iteritems() if v != conn])
+
+
+            #elif s is conn:
+            else:
+                # data from the network: read it, and write it to the tun/tap interface.
+                # We need to read the length first, and then the packet
+                conn = s
+
+                # Read length
+                try:
+                    nread, buf = read_all_data(conn, 2)
+                    plength = unpack('!H', buf)[0]
+                except (socket.error, TLSAbruptCloseError, struct.error):
+                    # the other end died
+                    conn.close()
+                    try:
+                        inp.remove(conn)
+                    except ValueError:
+                        pass
+                    clients = dict([(k,v) for k,v in clients.iteritems() if v != conn])
+                    continue
+
+                net2tap += 1
+                # read packet
+                try:
+                    nread, buf = read_all_data(conn, plength)
+                except (socket.error, TLSAbruptCloseError):
+                    # the other end died
+                    conn.close()
+                    try:
+                        inp.remove(conn)
+                    except ValueError:
+                        pass
+                    clients = dict([(k,v) for k,v in clients.iteritems() if v != conn])
+                    continue
+                log.debug("SERVER: NET2TAP %lu: Read %d bytes from the network" % (net2tap, nread))
+
+                hwaddr = get_src_hwaddr_from_packet(buf)
+                #hwdstaddr = get_dst_hwaddr_from_packet(buf)
+                if hwaddr == 'ffffffffffff':
+                    # it's a broadcast
+                    # write to all clients
+                    conns = clients.values()
+                    for _conn in conns:
+                        try:
+                            write_data(_conn, "%s%s" % (pack('!H', plength), buf))
+                        except (socket.error, TLSAbruptCloseError, struct.error):
+                            # The other end died
+                            conn.close()
+                            try:
+                                inp.remove(conn)
+                            except ValueError:
+                                pass
+                            clients = dict([(k,v) for k,v in clients.iteritems() if v != conn])
+                    # write to tun/tap also
+                    try:
+                        nwrite = write_data(tun, buf)
+                    except (socket.error, TLSAbruptCloseError, struct.error):
+                        # The other end died
+                        conn.close()
+                        try:
+                            inp.remove(conn)
+                        except ValueError:
+                            pass
+                        clients = dict([(k,v) for k,v in clients.iteritems() if v != conn])
+                    log.debug("SERVER: NET2TAP %lu: Written %d bytes to the tap interface" % (net2tap, nwrite))
+                elif clients.has_key(hwaddr):
+                    # Client to client communication
+                    _conn = clients[hwaddr]
+                    try:
+                        write_data(_conn, "%s%s" % (pack('!H', plength), buf))
+                    except (socket.error, TLSAbruptCloseError, struct.error):
+                        # The other end died
+                        conn.close()
+                        try:
+                            inp.remove(conn)
+                        except ValueError:
+                            pass
+                        clients = dict([(k,v) for k,v in clients.iteritems() if v != conn])
+                else:
+                    # now buf contains a full packet or frame, write it into the tun/tap interface
+                    try:
+                        nwrite = write_data(tun, buf)
+                    except (socket.error, TLSAbruptCloseError, struct.error):
+                        # The other end died
+                        conn.close()
+                        try:
+                            inp.remove(conn)
+                        except ValueError:
+                            pass
+                        clients = dict([(k,v) for k,v in clients.iteritems() if v != conn])
+                    log.debug("SERVER: NET2TAP %lu: Written %d bytes to the tap interface" % (net2tap, nwrite))
+
+        #if not inputready:
+        #    print 'timeout'
+
+
+def mainloop_client(tun, conn):
+    inp = [tun, conn]
+    tap2net = 0; net2tap = 0
+    running = True
+    while running:
+        inputready, outputready, exceptready = select.select(inp,[],[])
+        for s in inputready:
+
+            if s is tun:
+                # data from tun/tap: just read it and write it to the network
+                nread, buf = read_data(tun, BUFSIZE)
+                tap2net += 1
+                log.debug("CLIENT: TAP2NET %lu: Read %d bytes from the tap interface" % (tap2net, nread))
+
+                # write length + packet
+                try:
+                    nwrite = write_data(conn, "%s%s" % (pack('!H', nread), buf))
+                except (socket.error, TLSAbruptCloseError, struct.error):
+                    running = False 
+                    break
+                log.debug("CLIENT: TAP2NET %lu: Written %d bytes to the network" % (tap2net, nwrite))
+
+            elif s is conn:
+                # data from the network: read it, and write it to the tun/tap interface.
+                # We need to read the length first, and then the packet
+
+                # Read length
+                try:
+                    nread, buf = read_all_data(conn, 2)
+                except TLSAbruptCloseError:
+                    # the other end died
+                    running = False
+                    break
+                plength = unpack('!H', buf)[0]
+
+                net2tap += 1
+                # read packet
+                try:
+                    nread, buf = read_all_data(conn, plength)
+                except TLSAbruptCloseError:
+                    # the other end died
+                    running = False
+                    break
+                log.debug("CLIENT: NET2TAP %lu: Read %d bytes from the network" % (net2tap, nread))
+
+                # now buf contains a full packet or frame, write it into the tun/tap interface
+                try:
+                    nwrite = write_data(tun, buf)
+                except (socket.error, TLSAbruptCloseError, struct.error):
+                    running = False 
+                    break
+                log.debug("CLIENT: NET2TAP %lu: Written %d bytes to the tap interface" % (net2tap, nwrite))
+        #if not inputready:
+        #    print 'timeout'
+
+
+
+def start(name):
+    server_mode = settings[name].server
+    host = settings[name].host
+    port = settings[name].port
+    ip = settings[name].tuntap_ip
+    tname = settings[name].tuntap_name
+    try:
+        up = settings[name].scripts_up
+    except AttributeError:
+        up = None
+    try:
+        down = settings[name].scripts_down
+    except AttributeError:
+        down = None
+
+    tun = tap_open(tname)
+
+    if up:
+        os.system(down)
+    else:
+        log.info('/sbin/ifconfig %s %s up' % (tun.name, ip))
+        os.system("/sbin/ifconfig %s %s up" % (tun.name, ip))
+
+    if server_mode:
+        sock = socket_open()
+
+        socket_bind_and_listen(sock, host, port, 5)
+        log.info('SERVER: listen on %s:%s'% (host, port))
+
+        try:
+            mainloop_server(tun, sock, name)
+        except KeyboardInterrupt:
+            log.info("SERVER: Keyboard interrupt. Quitting...")
+
+        if down: os.system(down)
+
+        sock.close()
+
+    else:
+        while True:
+            sock = socket_open()
+
+            try:
+                sock.connect((host, port))
+                log.info('CLIENT: connect to %s:%s'% (host, port))
+            except KeyboardInterrupt:
+                log.info("CLIENT: Keyboard interrupt. Quitting...")
+                break
+            except:
+                time.sleep(5)
+                continue
+
+            conn = authentication_client(name, sock)
+            if conn:
+                hwaddr = get_local_hwaddr(tun.name)
+                conn.send(hwaddr)
+                log.info("CLIENT: Connected to server (%s:%d)" % (host, port))
+
+                print_tlsinfo(conn)
+
+                try:
+                    mainloop_client(tun, conn)
+                    time.sleep(5)
+                except KeyboardInterrupt:
+                    log.info("CLIENT: Keyboard interrupt. Quitting...")
+                    break
+                except:
+                    pass
+
+                if down:
+                    os.system(down)
+
+                conn.close()
+            sock.close()
+
+
+def usage(prog, dest):
+    print >> dest, "Usage: %s <name>" % prog
+    print >> dest, "   name - A config class name"
+    return 0
+
+
+def main():
+    if len(sys.argv) != 2:
+        return usage(sys.argv[0], sys.stderr)
+
+    start(sys.argv[1])
+
+if __name__ == '__main__':
+    sys.exit(main())
+

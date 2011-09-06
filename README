@@ -1,0 +1,42 @@
+tuny
+====
+
+tuny is an open source simple userspace implementation
+of a tap vpn for linux. This is more of a proof of concept
+than anything else, but it's working, at least for me :).
+
+For more robusts tun/tap vpn solutions see for example tinc or OpenVPN
+
+tuny is licensed under the GNU General Public License, Version 3
+(http://www.gnu.org/licenses/).
+
+
+Usage
+-----
+
+Copy conf.py.dist to conf.py.
+There are two different configurations modes.
+One for server mode and the other for client mode.
+Check conf.py.dist for details
+
+Than run for server mode as root, eg:
+
+    # python tuny server01
+
+For client mode, eg:
+
+    # python tuny client01
+
+
+Scenarios
+---------
+
+TODO
+
+
+Required
+--------
+
+	- python 2.4+
+
+	- tlslite 0.3.8 : http://trevp.net/tlslite/
