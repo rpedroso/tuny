@@ -10,9 +10,9 @@ import socket
 import struct
 from struct import pack, unpack
 from fcntl import ioctl
-from tlslite.VerifierDB import VerifierDB
-from tlslite.TLSConnection import TLSConnection
-from tlslite.HandshakeSettings import HandshakeSettings
+from tlslite.verifierdb import VerifierDB
+from tlslite.tlsconnection import TLSConnection
+from tlslite.handshakesettings import HandshakeSettings
 from tlslite.errors import TLSAbruptCloseError
 import select
 import time

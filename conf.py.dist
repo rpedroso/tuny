@@ -8,7 +8,7 @@ class Handshake:
     maxKeySize = 8193
     cipherNames = ["aes256", "aes128", "3des", "rc4"]
     cipherImplementations = ["cryptlib", "openssl", "pycrypto", "python"]
-    certificateTypes = ["x509", "cryptoID"]
+    certificateTypes = ["x509"]
     minVersion = (3,0)
     maxVersion = (3,2)
 
